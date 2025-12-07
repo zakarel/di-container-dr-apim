@@ -21,19 +21,25 @@ provider "azurerm" {
 
 # Variables
 variable "resource_group_name" {
-  description = "Name of the resource group"
+  description = "Name of the existing resource group"
   type        = string
-  default     = "di-container-dr-rg"
+  default     = "rg-gp-test"
+}
+
+variable "resource_group_location" {
+  description = "Location of the existing resource group"
+  type        = string
+  default     = "eastus2"
 }
 
 variable "primary_location" {
-  description = "Primary Azure region"
+  description = "Primary Azure region for main cluster"
   type        = string
   default     = "eastus2"
 }
 
 variable "secondary_location" {
-  description = "Secondary Azure region"
+  description = "Secondary Azure region for DR cluster"
   type        = string
   default     = "westus"
 }
@@ -56,35 +62,16 @@ variable "document_intelligence_endpoint" {
   sensitive   = true
 }
 
-variable "container_image_version" {
-  description = "Document Intelligence container image version"
-  type        = string
-  default     = "4.0.2024-11-30"
+# Data source for existing resource group
+data "azurerm_resource_group" "rg" {
+  name = var.resource_group_name
 }
-
-# Resource Group - Primary
-resource "azurerm_resource_group" "rg_primary" {
-  name     = "${var.resource_group_name}-primary"
-  location = var.primary_location
-
-  tags = {
-    environment = var.environment
-    solution    = "document-intelligence-dr"
-    region      = "primary"
-  }
-}
-
-# Resource Group - Secondary
-resource "azurerm_resource_group" "rg_secondary" {
-  name     = "${var.resource_group_name}-secondary"
-  location = var.secondary_location
-
   tags = {
     environment = var.environment
     solution    = "document-intelligence-dr"
     region      = "secondary"
   }
-}
+
 
 # ====================================
 # Cluster 1: Primary DI Container Cluster
@@ -107,13 +94,13 @@ resource "azurerm_kubernetes_cluster" "di_primary" {
       cluster = "primary"
     }
   }
-
+}
   identity {
-    type = "SystemAssigned"
-  }
-
-  # Configure Cilium as CNI
-  network_profile {
+resource "azurerm_kubernetes_cluster" "di_primary" {
+  name                = "aks-di-main-${var.environment}"
+  location            = var.primary_location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  dns_prefix          = "di-main-${var.environment}"
     network_plugin      = "cilium"
     network_plugin_mode = "overlay"
     network_policy      = "cilium"
@@ -151,13 +138,14 @@ resource "azurerm_kubernetes_cluster" "di_secondary" {
       cluster = "secondary"
     }
   }
+}
 
   identity {
-    type = "SystemAssigned"
-  }
-
-  # Configure Cilium as CNI
-  network_profile {
+resource "azurerm_kubernetes_cluster" "di_secondary" {
+  name                = "aks-di-sec-${var.environment}"
+  location            = var.secondary_location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  dns_prefix          = "di-sec-${var.environment}"
     network_plugin      = "cilium"
     network_plugin_mode = "overlay"
     network_policy      = "cilium"
