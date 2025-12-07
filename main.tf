@@ -6,11 +6,11 @@ terraform {
     }
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = "~> 2.0"
+      version = "~> 2.24"
     }
     helm = {
       source  = "hashicorp/helm"
-      version = "~> 2.0"
+      version = "~> 2.13"
     }
   }
 }
@@ -50,38 +50,68 @@ variable "environment" {
   default     = "prod"
 }
 
-variable "document_intelligence_key" {
-  description = "Document Intelligence API Key"
+variable "cognitive_services_sku" {
+  description = "SKU for Cognitive Services (Document Intelligence)"
   type        = string
-  sensitive   = true
-}
-
-variable "document_intelligence_endpoint" {
-  description = "Document Intelligence Endpoint URI"
-  type        = string
-  sensitive   = true
+  default     = "S0"
 }
 
 # Data source for existing resource group
 data "azurerm_resource_group" "rg" {
   name = var.resource_group_name
 }
-  tags = {
-    environment = var.environment
-    solution    = "document-intelligence-dr"
-    region      = "secondary"
-  }
-
 
 # ====================================
-# Cluster 1: Primary DI Container Cluster
+# Document Intelligence Account - Primary (eastus2)
+# ====================================
+
+resource "azurerm_cognitive_account" "di_primary" {
+  name                = "cogn-di-main-${var.environment}"
+  location            = var.primary_location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  kind                = "FormRecognizer"
+  sku_name            = var.cognitive_services_sku
+
+  tags = {
+    environment = var.environment
+    cluster     = "main"
+    solution    = "document-intelligence-dr"
+  }
+}
+
+# ====================================
+# Document Intelligence Account - Secondary (westus)
+# ====================================
+
+resource "azurerm_cognitive_account" "di_secondary" {
+  name                = "cogn-di-sec-${var.environment}"
+  location            = var.secondary_location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  kind                = "FormRecognizer"
+  sku_name            = var.cognitive_services_sku
+
+  tags = {
+    environment = var.environment
+    cluster     = "secondary"
+    solution    = "document-intelligence-dr"
+  }
+}
+
+variable "container_image_version" {
+  description = "Document Intelligence container image version"
+  type        = string
+  default     = "4.0.2024-11-30"
+}
+
+# ====================================
+# Cluster 1: Primary DI Container Cluster (Main - eastus2)
 # ====================================
 
 resource "azurerm_kubernetes_cluster" "di_primary" {
-  name                = "aks-di-primary-${var.environment}"
-  location            = azurerm_resource_group.rg_primary.location
-  resource_group_name = azurerm_resource_group.rg_primary.name
-  dns_prefix          = "di-primary-${var.environment}"
+  name                = "aks-di-main-${var.environment}"
+  location            = var.primary_location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  dns_prefix          = "di-main-${var.environment}"
   kubernetes_version  = "1.29"
 
   default_node_pool {
@@ -94,89 +124,42 @@ resource "azurerm_kubernetes_cluster" "di_primary" {
       cluster = "primary"
     }
   }
-}
+
   identity {
-resource "azurerm_kubernetes_cluster" "di_primary" {
-  name                = "aks-di-main-${var.environment}"
-  location            = var.primary_location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  dns_prefix          = "di-main-${var.environment}"
-    network_plugin      = "cilium"
-    network_plugin_mode = "overlay"
+    type = "SystemAssigned"
+  }
+
+  # Configure Cilium as CNI
+  network_profile {
+    network_plugin      = "azure"
     network_policy      = "cilium"
-    ebpf_data_plane     = "cilium"
+    network_data_plane  = "cilium"
     service_cidr        = "10.0.0.0/16"
     dns_service_ip      = "10.0.0.10"
-    docker_bridge_cidr  = "172.17.0.1/16"
     pod_cidr            = "10.244.0.0/16"
   }
 
   tags = {
     environment = var.environment
-    cluster     = "primary"
+    cluster     = "main"
   }
 }
 
 # ====================================
-# Cluster 2: Secondary DI Container Cluster (DR)
+# Cluster 2: Secondary DI Container Cluster (DR - westus)
 # ====================================
 
 resource "azurerm_kubernetes_cluster" "di_secondary" {
-  name                = "aks-di-secondary-${var.environment}"
-  location            = azurerm_resource_group.rg_secondary.location
-  resource_group_name = azurerm_resource_group.rg_secondary.name
-  dns_prefix          = "di-secondary-${var.environment}"
+  name                = "aks-di-sec-${var.environment}"
+  location            = var.secondary_location
+  resource_group_name = data.azurerm_resource_group.rg.name
+  dns_prefix          = "di-sec-${var.environment}"
   kubernetes_version  = "1.29"
 
   default_node_pool {
     name            = "default"
     node_count      = 2
     vm_size         = "Standard_D4s_v3"
-    os_disk_size_gb = 128
-
-    tags = {
-      cluster = "secondary"
-    }
-  }
-}
-
-  identity {
-resource "azurerm_kubernetes_cluster" "di_secondary" {
-  name                = "aks-di-sec-${var.environment}"
-  location            = var.secondary_location
-  resource_group_name = data.azurerm_resource_group.rg.name
-  dns_prefix          = "di-sec-${var.environment}"
-    network_plugin      = "cilium"
-    network_plugin_mode = "overlay"
-    network_policy      = "cilium"
-    ebpf_data_plane     = "cilium"
-    service_cidr        = "10.1.0.0/16"
-    dns_service_ip      = "10.1.0.10"
-    docker_bridge_cidr  = "172.18.0.1/16"
-    pod_cidr            = "10.245.0.0/16"
-  }
-
-  tags = {
-    environment = var.environment
-    cluster     = "secondary"
-  }
-}
-
-# ====================================
-# Cluster 2: Secondary DI Container Cluster (DR)
-# ====================================
-
-resource "azurerm_kubernetes_cluster" "di_secondary" {
-  name                = "aks-di-secondary-${var.environment}"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  dns_prefix          = "di-secondary-${var.environment}"
-  kubernetes_version  = "1.29"
-
-  default_node_pool {
-    name            = "default"
-    node_count      = 2
-    vm_size         = "Standard_D4s_v3" # 4 vCPUs, 16 GB RAM - minimum for DI workloads
     os_disk_size_gb = 128
 
     tags = {
@@ -190,13 +173,11 @@ resource "azurerm_kubernetes_cluster" "di_secondary" {
 
   # Configure Cilium as CNI
   network_profile {
-    network_plugin      = "cilium"
-    network_plugin_mode = "overlay"
+    network_plugin      = "azure"
     network_policy      = "cilium"
-    ebpf_data_plane     = "cilium"
+    network_data_plane  = "cilium"
     service_cidr        = "10.1.0.0/16"
     dns_service_ip      = "10.1.0.10"
-    docker_bridge_cidr  = "172.18.0.1/16"
     pod_cidr            = "10.245.0.0/16"
   }
 
@@ -323,7 +304,7 @@ resource "helm_release" "hubble_secondary" {
 }
 
 # ====================================
-# Namespace for DI Containers
+# Namespace for DI Containers - Primary
 # ====================================
 
 resource "kubernetes_namespace" "di_primary" {
@@ -338,6 +319,10 @@ resource "kubernetes_namespace" "di_primary" {
 
   depends_on = [azurerm_kubernetes_cluster.di_primary]
 }
+
+# ====================================
+# Namespace for DI Containers - Secondary
+# ====================================
 
 resource "kubernetes_namespace" "di_secondary" {
   provider = kubernetes.secondary
@@ -367,11 +352,14 @@ resource "kubernetes_secret" "di_credentials_primary" {
   type = "Opaque"
 
   data = {
-    "api-key"  = base64encode(var.document_intelligence_key)
-    "endpoint" = base64encode(var.document_intelligence_endpoint)
+    "api-key"  = base64encode(azurerm_cognitive_account.di_primary.primary_access_key)
+    "endpoint" = base64encode(azurerm_cognitive_account.di_primary.endpoint)
   }
 
-  depends_on = [kubernetes_namespace.di_primary]
+  depends_on = [
+    kubernetes_namespace.di_primary,
+    azurerm_cognitive_account.di_primary
+  ]
 }
 
 # ====================================
@@ -389,11 +377,14 @@ resource "kubernetes_secret" "di_credentials_secondary" {
   type = "Opaque"
 
   data = {
-    "api-key"  = base64encode(var.document_intelligence_key)
-    "endpoint" = base64encode(var.document_intelligence_endpoint)
+    "api-key"  = base64encode(azurerm_cognitive_account.di_secondary.primary_access_key)
+    "endpoint" = base64encode(azurerm_cognitive_account.di_secondary.endpoint)
   }
 
-  depends_on = [kubernetes_namespace.di_secondary]
+  depends_on = [
+    kubernetes_namespace.di_secondary,
+    azurerm_cognitive_account.di_secondary
+  ]
 }
 
 # ====================================
