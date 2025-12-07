@@ -56,6 +56,12 @@ variable "document_intelligence_endpoint" {
   sensitive   = true
 }
 
+variable "container_image_version" {
+  description = "Document Intelligence container image version"
+  type        = string
+  default     = "4.0.2024-11-30"
+}
+
 # Resource Group - Primary
 resource "azurerm_resource_group" "rg_primary" {
   name     = "${var.resource_group_name}-primary"
@@ -71,12 +77,12 @@ resource "azurerm_resource_group" "rg_primary" {
 # Resource Group - Secondary
 resource "azurerm_resource_group" "rg_secondary" {
   name     = "${var.resource_group_name}-secondary"
-resource "azurerm_kubernetes_cluster" "di_primary" {
-  name                = "aks-di-primary-${var.environment}"
-  location            = azurerm_resource_group.rg_primary.location
-  resource_group_name = azurerm_resource_group.rg_primary.name
-  dns_prefix          = "di-primary-${var.environment}"
-  kubernetes_version  = "1.29"
+  location = var.secondary_location
+
+  tags = {
+    environment = var.environment
+    solution    = "document-intelligence-dr"
+    region      = "secondary"
   }
 }
 
@@ -86,15 +92,15 @@ resource "azurerm_kubernetes_cluster" "di_primary" {
 
 resource "azurerm_kubernetes_cluster" "di_primary" {
   name                = "aks-di-primary-${var.environment}"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg_primary.location
+  resource_group_name = azurerm_resource_group.rg_primary.name
   dns_prefix          = "di-primary-${var.environment}"
   kubernetes_version  = "1.29"
 
   default_node_pool {
     name            = "default"
     node_count      = 2
-    vm_size         = "Standard_D4s_v3" # 4 vCPUs, 16 GB RAM - minimum for DI workloads
+    vm_size         = "Standard_D4s_v3"
     os_disk_size_gb = 128
 
     tags = {
@@ -115,14 +121,57 @@ resource "azurerm_kubernetes_cluster" "di_primary" {
     service_cidr        = "10.0.0.0/16"
     dns_service_ip      = "10.0.0.10"
     docker_bridge_cidr  = "172.17.0.1/16"
+    pod_cidr            = "10.244.0.0/16"
+  }
+
+  tags = {
+    environment = var.environment
+    cluster     = "primary"
+  }
+}
+
+# ====================================
+# Cluster 2: Secondary DI Container Cluster (DR)
+# ====================================
+
 resource "azurerm_kubernetes_cluster" "di_secondary" {
   name                = "aks-di-secondary-${var.environment}"
   location            = azurerm_resource_group.rg_secondary.location
   resource_group_name = azurerm_resource_group.rg_secondary.name
   dns_prefix          = "di-secondary-${var.environment}"
   kubernetes_version  = "1.29"
+
+  default_node_pool {
+    name            = "default"
+    node_count      = 2
+    vm_size         = "Standard_D4s_v3"
+    os_disk_size_gb = 128
+
+    tags = {
+      cluster = "secondary"
+    }
   }
-}
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  # Configure Cilium as CNI
+  network_profile {
+    network_plugin      = "cilium"
+    network_plugin_mode = "overlay"
+    network_policy      = "cilium"
+    ebpf_data_plane     = "cilium"
+    service_cidr        = "10.1.0.0/16"
+    dns_service_ip      = "10.1.0.10"
+    docker_bridge_cidr  = "172.18.0.1/16"
+    pod_cidr            = "10.245.0.0/16"
+  }
+
+  tags = {
+    environment = var.environment
+    cluster     = "secondary"
+  }
 }
 
 # ====================================
@@ -327,6 +376,8 @@ resource "kubernetes_secret" "di_credentials_primary" {
     namespace = kubernetes_namespace.di_primary.metadata[0].name
   }
 
+  type = "Opaque"
+
   data = {
     "api-key"  = base64encode(var.document_intelligence_key)
     "endpoint" = base64encode(var.document_intelligence_endpoint)
@@ -347,9 +398,165 @@ resource "kubernetes_secret" "di_credentials_secondary" {
     namespace = kubernetes_namespace.di_secondary.metadata[0].name
   }
 
+  type = "Opaque"
+
   data = {
     "api-key"  = base64encode(var.document_intelligence_key)
     "endpoint" = base64encode(var.document_intelligence_endpoint)
+  }
+
+  depends_on = [kubernetes_namespace.di_secondary]
+}
+
+# ====================================
+# Network Policy - Primary (Restrict Traffic)
+# ====================================
+
+resource "kubernetes_network_policy" "di_primary" {
+  provider = kubernetes.primary
+
+  metadata {
+    name      = "di-layout-network-policy"
+    namespace = kubernetes_namespace.di_primary.metadata[0].name
+  }
+
+  spec {
+    pod_selector {
+      match_labels = {
+        app = "di-layout"
+      }
+    }
+
+    policy_types = ["Ingress", "Egress"]
+
+    # Allow ingress only from specific sources
+    ingress {
+      from {
+        pod_selector {
+          match_labels = {
+            "app.kubernetes.io/name" = "ingress-nginx"
+          }
+        }
+      }
+      ports {
+        protocol = "TCP"
+        port     = "5000"
+      }
+    }
+
+    # Allow egress for DNS and external services
+    egress {
+      to {
+        namespace_selector {}
+      }
+      ports {
+        protocol = "UDP"
+        port     = "53"
+      }
+    }
+
+    # Allow egress to Azure services
+    egress {
+      to {
+        pod_selector {}
+      }
+      ports {
+        protocol = "TCP"
+        port     = "443"
+      }
+    }
+  }
+
+  depends_on = [kubernetes_namespace.di_primary]
+}
+
+# ====================================
+# Network Policy - Secondary (Restrict Traffic)
+# ====================================
+
+resource "kubernetes_network_policy" "di_secondary" {
+  provider = kubernetes.secondary
+
+  metadata {
+    name      = "di-layout-network-policy"
+    namespace = kubernetes_namespace.di_secondary.metadata[0].name
+  }
+
+  spec {
+    pod_selector {
+      match_labels = {
+        app = "di-layout"
+      }
+    }
+
+    policy_types = ["Ingress", "Egress"]
+
+    # Allow ingress only from specific sources
+    ingress {
+      from {
+        pod_selector {
+          match_labels = {
+            "app.kubernetes.io/name" = "ingress-nginx"
+          }
+        }
+      }
+      ports {
+        protocol = "TCP"
+        port     = "5000"
+      }
+    }
+
+    # Allow egress for DNS and external services
+    egress {
+      to {
+        namespace_selector {}
+      }
+      ports {
+        protocol = "UDP"
+        port     = "53"
+      }
+    }
+
+    # Allow egress to Azure services
+    egress {
+      to {
+        pod_selector {}
+      }
+      ports {
+        protocol = "TCP"
+        port     = "443"
+      }
+    }
+  }
+
+  depends_on = [kubernetes_namespace.di_secondary]
+}
+
+# ====================================
+# Service Account - Primary
+# ====================================
+
+resource "kubernetes_service_account" "di_sa_primary" {
+  provider = kubernetes.primary
+
+  metadata {
+    name      = "di-layout-sa"
+    namespace = kubernetes_namespace.di_primary.metadata[0].name
+  }
+
+  depends_on = [kubernetes_namespace.di_primary]
+}
+
+# ====================================
+# Service Account - Secondary
+# ====================================
+
+resource "kubernetes_service_account" "di_sa_secondary" {
+  provider = kubernetes.secondary
+
+  metadata {
+    name      = "di-layout-sa"
+    namespace = kubernetes_namespace.di_secondary.metadata[0].name
   }
 
   depends_on = [kubernetes_namespace.di_secondary]
@@ -385,14 +592,21 @@ resource "kubernetes_deployment" "di_layout_primary" {
         labels = {
           app = "di-layout"
         }
+        annotations = {
+          "container.apparmor.security.beta.kubernetes.io/di-layout" = "runtime/default"
+        }
       }
 
       spec {
+        service_account_name = kubernetes_service_account.di_sa_primary.metadata[0].name
+
         container {
           name  = "di-layout"
-          image = "mcr.microsoft.com/azure-cognitive-services/form-recognizer/layout-4.0:latest"
+          image = "mcr.microsoft.com/azure-cognitive-services/form-recognizer/layout-${var.container_image_version}"
 
-          # Resource requirements per Azure documentation (8 cores, 16GB memory minimum)
+          image_pull_policy = "IfNotPresent"
+
+          # Resource requirements per Azure documentation
           resources {
             limits = {
               cpu    = "2"
@@ -459,15 +673,45 @@ resource "kubernetes_deployment" "di_layout_primary" {
             failure_threshold     = 3
           }
 
-          # Enable privileged mode for accessing cgroup v2 (required for Cilium)
+          # Security context
           security_context {
             allow_privilege_escalation = false
             read_only_root_filesystem  = false
+            run_as_non_root           = true
+            run_as_user               = 1000
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "tmp-volume"
+            mount_path = "/tmp"
+          }
+
+          volume_mount {
+            name       = "cache-volume"
+            mount_path = "/home/user"
           }
         }
 
+        # Pod-level security context
         security_context {
-          fs_group = 1000
+          fs_group             = 1000
+          supplemental_groups  = [1000]
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+
+        volume {
+          name = "tmp-volume"
+          empty_dir {}
+        }
+
+        volume {
+          name = "cache-volume"
+          empty_dir {}
         }
 
         affinity {
@@ -494,8 +738,8 @@ resource "kubernetes_deployment" "di_layout_primary" {
     strategy {
       type = "RollingUpdate"
       rolling_update {
-        max_surge       = "1"
-        max_unavailable = "1"
+        max_surge       = 1
+        max_unavailable = 0
       }
     }
   }
@@ -534,7 +778,7 @@ resource "kubernetes_service" "di_layout_primary" {
       protocol    = "TCP"
     }
 
-    type = "LoadBalancer"
+    type = "ClusterIP"
   }
 
   depends_on = [kubernetes_deployment.di_layout_primary]
@@ -570,14 +814,21 @@ resource "kubernetes_deployment" "di_layout_secondary" {
         labels = {
           app = "di-layout"
         }
+        annotations = {
+          "container.apparmor.security.beta.kubernetes.io/di-layout" = "runtime/default"
+        }
       }
 
       spec {
+        service_account_name = kubernetes_service_account.di_sa_secondary.metadata[0].name
+
         container {
           name  = "di-layout"
-          image = "mcr.microsoft.com/azure-cognitive-services/form-recognizer/layout-4.0:latest"
+          image = "mcr.microsoft.com/azure-cognitive-services/form-recognizer/layout-${var.container_image_version}"
 
-          # Resource requirements per Azure documentation (8 cores, 16GB memory minimum)
+          image_pull_policy = "IfNotPresent"
+
+          # Resource requirements per Azure documentation
           resources {
             limits = {
               cpu    = "2"
@@ -644,15 +895,45 @@ resource "kubernetes_deployment" "di_layout_secondary" {
             failure_threshold     = 3
           }
 
-          # Enable privileged mode for accessing cgroup v2 (required for Cilium)
+          # Security context
           security_context {
             allow_privilege_escalation = false
             read_only_root_filesystem  = false
+            run_as_non_root           = true
+            run_as_user               = 1000
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "tmp-volume"
+            mount_path = "/tmp"
+          }
+
+          volume_mount {
+            name       = "cache-volume"
+            mount_path = "/home/user"
           }
         }
 
+        # Pod-level security context
         security_context {
-          fs_group = 1000
+          fs_group             = 1000
+          supplemental_groups  = [1000]
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+
+        volume {
+          name = "tmp-volume"
+          empty_dir {}
+        }
+
+        volume {
+          name = "cache-volume"
+          empty_dir {}
         }
 
         affinity {
@@ -679,8 +960,8 @@ resource "kubernetes_deployment" "di_layout_secondary" {
     strategy {
       type = "RollingUpdate"
       rolling_update {
-        max_surge       = "1"
-        max_unavailable = "1"
+        max_surge       = 1
+        max_unavailable = 0
       }
     }
   }
@@ -719,7 +1000,7 @@ resource "kubernetes_service" "di_layout_secondary" {
       protocol    = "TCP"
     }
 
-    type = "LoadBalancer"
+    type = "ClusterIP"
   }
 
   depends_on = [kubernetes_deployment.di_layout_secondary]
@@ -742,21 +1023,18 @@ output "secondary_cluster_name" {
 output "primary_cluster_id" {
   description = "Primary AKS cluster resource ID"
   value       = azurerm_kubernetes_cluster.di_primary.id
+  sensitive   = true
 }
 
 output "secondary_cluster_id" {
   description = "Secondary AKS cluster resource ID"
   value       = azurerm_kubernetes_cluster.di_secondary.id
+  sensitive   = true
 }
 
-output "primary_di_service_endpoint" {
-  description = "Primary Document Intelligence service endpoint"
-  value       = "kubectl get svc -n document-intelligence di-layout-service"
-}
-
-output "secondary_di_service_endpoint" {
-  description = "Secondary Document Intelligence service endpoint"
-  value       = "kubectl get svc -n document-intelligence di-layout-service"
+output "note_service_access" {
+  description = "Services are deployed with ClusterIP type. For external access, use kubectl port-forward or configure an Ingress controller with TLS."
+  value       = "kubectl port-forward -n document-intelligence svc/di-layout-service 5000:5000"
 }
 
 output "hubble_ui_access_primary" {
