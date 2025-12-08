@@ -8,10 +8,6 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.24"
     }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.13"
-    }
   }
 }
 
@@ -19,17 +15,14 @@ provider "azurerm" {
   features {}
 }
 
+# ====================================
 # Variables
+# ====================================
+
 variable "resource_group_name" {
   description = "Name of the existing resource group"
   type        = string
   default     = "rg-gp-test"
-}
-
-variable "resource_group_location" {
-  description = "Location of the existing resource group"
-  type        = string
-  default     = "eastus2"
 }
 
 variable "primary_location" {
@@ -50,19 +43,22 @@ variable "environment" {
   default     = "prod"
 }
 
-variable "cognitive_services_sku" {
-  description = "SKU for Cognitive Services (Document Intelligence)"
+variable "container_image_version" {
+  description = "Document Intelligence container image version"
   type        = string
-  default     = "S0"
+  default     = "4.0.2024-11-30"
 }
 
-# Data source for existing resource group
+# ====================================
+# Data Sources
+# ====================================
+
 data "azurerm_resource_group" "rg" {
   name = var.resource_group_name
 }
 
 # ====================================
-# Document Intelligence Account - Primary (eastus2)
+# Document Intelligence - Primary (eastus2)
 # ====================================
 
 resource "azurerm_cognitive_account" "di_primary" {
@@ -70,17 +66,16 @@ resource "azurerm_cognitive_account" "di_primary" {
   location            = var.primary_location
   resource_group_name = data.azurerm_resource_group.rg.name
   kind                = "FormRecognizer"
-  sku_name            = var.cognitive_services_sku
+  sku_name            = "S0"
 
   tags = {
     environment = var.environment
-    cluster     = "main"
-    solution    = "document-intelligence-dr"
+    region      = "primary"
   }
 }
 
 # ====================================
-# Document Intelligence Account - Secondary (westus)
+# Document Intelligence - Secondary (westus)
 # ====================================
 
 resource "azurerm_cognitive_account" "di_secondary" {
@@ -88,19 +83,12 @@ resource "azurerm_cognitive_account" "di_secondary" {
   location            = var.secondary_location
   resource_group_name = data.azurerm_resource_group.rg.name
   kind                = "FormRecognizer"
-  sku_name            = var.cognitive_services_sku
+  sku_name            = "S0"
 
   tags = {
     environment = var.environment
-    cluster     = "secondary"
-    solution    = "document-intelligence-dr"
+    region      = "secondary"
   }
-}
-
-variable "container_image_version" {
-  description = "Document Intelligence container image version"
-  type        = string
-  default     = "4.0.2024-11-30"
 }
 
 # ====================================
@@ -112,7 +100,7 @@ resource "azurerm_kubernetes_cluster" "di_primary" {
   location            = var.primary_location
   resource_group_name = data.azurerm_resource_group.rg.name
   dns_prefix          = "di-main-${var.environment}"
-  kubernetes_version  = "1.29"
+  kubernetes_version  = "1.32"
 
   default_node_pool {
     name            = "default"
@@ -132,6 +120,7 @@ resource "azurerm_kubernetes_cluster" "di_primary" {
   # Configure Cilium as CNI
   network_profile {
     network_plugin      = "azure"
+    network_plugin_mode = "overlay"
     network_policy      = "cilium"
     network_data_plane  = "cilium"
     service_cidr        = "10.0.0.0/16"
@@ -154,7 +143,7 @@ resource "azurerm_kubernetes_cluster" "di_secondary" {
   location            = var.secondary_location
   resource_group_name = data.azurerm_resource_group.rg.name
   dns_prefix          = "di-sec-${var.environment}"
-  kubernetes_version  = "1.29"
+  kubernetes_version  = "1.32"
 
   default_node_pool {
     name            = "default"
@@ -174,6 +163,7 @@ resource "azurerm_kubernetes_cluster" "di_secondary" {
   # Configure Cilium as CNI
   network_profile {
     network_plugin      = "azure"
+    network_plugin_mode = "overlay"
     network_policy      = "cilium"
     network_data_plane  = "cilium"
     service_cidr        = "10.1.0.0/16"
@@ -211,97 +201,7 @@ provider "kubernetes" {
 # Helm Providers for Cilium & Hubble
 # ====================================
 
-provider "helm" {
-  alias = "primary"
 
-  kubernetes {
-    host                   = azurerm_kubernetes_cluster.di_primary.kube_config[0].host
-    client_certificate     = base64decode(azurerm_kubernetes_cluster.di_primary.kube_config[0].client_certificate)
-    client_key             = base64decode(azurerm_kubernetes_cluster.di_primary.kube_config[0].client_key)
-    cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.di_primary.kube_config[0].cluster_ca_certificate)
-  }
-}
-
-provider "helm" {
-  alias = "secondary"
-
-  kubernetes {
-    host                   = azurerm_kubernetes_cluster.di_secondary.kube_config[0].host
-    client_certificate     = base64decode(azurerm_kubernetes_cluster.di_secondary.kube_config[0].client_certificate)
-    client_key             = base64decode(azurerm_kubernetes_cluster.di_secondary.kube_config[0].client_key)
-    cluster_ca_certificate = base64decode(azurerm_kubernetes_cluster.di_secondary.kube_config[0].cluster_ca_certificate)
-  }
-}
-
-# ====================================
-# Hubble Helm Release - Primary Cluster
-# ====================================
-
-resource "helm_release" "hubble_primary" {
-  provider   = helm.primary
-  name       = "hubble"
-  repository = "https://helm.cilium.io"
-  chart      = "cilium"
-  namespace  = "kube-system"
-  version    = "1.15.0"
-
-  set {
-    name  = "hubble.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "hubble.relay.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "hubble.ui.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "prometheus.enabled"
-    value = "true"
-  }
-
-  depends_on = [azurerm_kubernetes_cluster.di_primary]
-}
-
-# ====================================
-# Hubble Helm Release - Secondary Cluster
-# ====================================
-
-resource "helm_release" "hubble_secondary" {
-  provider   = helm.secondary
-  name       = "hubble"
-  repository = "https://helm.cilium.io"
-  chart      = "cilium"
-  namespace  = "kube-system"
-  version    = "1.15.0"
-
-  set {
-    name  = "hubble.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "hubble.relay.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "hubble.ui.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "prometheus.enabled"
-    value = "true"
-  }
-
-  depends_on = [azurerm_kubernetes_cluster.di_secondary]
-}
 
 # ====================================
 # Namespace for DI Containers - Primary
@@ -338,7 +238,7 @@ resource "kubernetes_namespace" "di_secondary" {
 }
 
 # ====================================
-# Secret for DI Credentials - Primary
+# Secret for DI Billing Credentials - Primary
 # ====================================
 
 resource "kubernetes_secret" "di_credentials_primary" {
@@ -352,8 +252,8 @@ resource "kubernetes_secret" "di_credentials_primary" {
   type = "Opaque"
 
   data = {
-    "api-key"  = base64encode(azurerm_cognitive_account.di_primary.primary_access_key)
-    "endpoint" = base64encode(azurerm_cognitive_account.di_primary.endpoint)
+    "api-key"  = azurerm_cognitive_account.di_primary.primary_access_key
+    "endpoint" = azurerm_cognitive_account.di_primary.endpoint
   }
 
   depends_on = [
@@ -363,7 +263,7 @@ resource "kubernetes_secret" "di_credentials_primary" {
 }
 
 # ====================================
-# Secret for DI Credentials - Secondary
+# Secret for DI Billing Credentials - Secondary
 # ====================================
 
 resource "kubernetes_secret" "di_credentials_secondary" {
@@ -377,8 +277,8 @@ resource "kubernetes_secret" "di_credentials_secondary" {
   type = "Opaque"
 
   data = {
-    "api-key"  = base64encode(azurerm_cognitive_account.di_secondary.primary_access_key)
-    "endpoint" = base64encode(azurerm_cognitive_account.di_secondary.endpoint)
+    "api-key"  = azurerm_cognitive_account.di_secondary.primary_access_key
+    "endpoint" = azurerm_cognitive_account.di_secondary.endpoint
   }
 
   depends_on = [
@@ -725,8 +625,7 @@ resource "kubernetes_deployment" "di_layout_primary" {
 
   depends_on = [
     kubernetes_namespace.di_primary,
-    kubernetes_secret.di_credentials_primary,
-    helm_release.hubble_primary
+    kubernetes_secret.di_credentials_primary
   ]
 }
 
@@ -947,8 +846,7 @@ resource "kubernetes_deployment" "di_layout_secondary" {
 
   depends_on = [
     kubernetes_namespace.di_secondary,
-    kubernetes_secret.di_credentials_secondary,
-    helm_release.hubble_secondary
+    kubernetes_secret.di_credentials_secondary
   ]
 }
 
@@ -1014,14 +912,4 @@ output "secondary_cluster_id" {
 output "note_service_access" {
   description = "Services are deployed with ClusterIP type. For external access, use kubectl port-forward or configure an Ingress controller with TLS."
   value       = "kubectl port-forward -n document-intelligence svc/di-layout-service 5000:5000"
-}
-
-output "hubble_ui_access_primary" {
-  description = "Access Hubble UI on primary cluster"
-  value       = "kubectl -n kube-system port-forward svc/hubble-ui 8081:80"
-}
-
-output "hubble_ui_access_secondary" {
-  description = "Access Hubble UI on secondary cluster"
-  value       = "kubectl -n kube-system port-forward svc/hubble-ui 8081:80"
 }
